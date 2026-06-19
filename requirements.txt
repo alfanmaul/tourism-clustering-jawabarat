@@ -10,4 +10,8 @@ pip
 python-dotenv
 ruff
 scikit-learn
+streamlit
+plotly
+joblib
+requests
 -e .
