@@ -1,33 +1,22 @@
+import logging
+import os
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
-import matplotlib.pyplot as plt
-import joblib
-import os
-import requests
 
 from tourism_clustering_jawabarat.config import (
     RAW_DATA_PATH,
     PROCESSED_DATA_PATH,
     MODEL_PATH,
     SCALER_PATH,
-    COLOR_PALETTE,
-    COORDINATES,
-    DEFAULT_N_CLUSTERS
 )
-from tourism_clustering_jawabarat.dataset import fetch_raw_data
-from tourism_clustering_jawabarat.preprocessing import clean_data
-from tourism_clustering_jawabarat.features import build_features
 from tourism_clustering_jawabarat.clustering import (
-    evaluate_kmeans_range,
-    train_and_save_kmeans,
     benchmark_clustering_models,
+    load_and_apply_kmeans,
 )
 from tourism_clustering_jawabarat.visualizations import (
-    plot_elbow_curve_plotly,
-    plot_silhouette_scores_plotly,
     plot_clusters_3d_plotly,
     plot_clusters_2d_plotly,
     plot_comparison_bar_plotly,
@@ -36,6 +25,15 @@ from tourism_clustering_jawabarat.visualizations import (
     plot_model_comparison_bar,
     plot_pca_2d_plotly,
 )
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# --- Startup Diagnostics ---
+logging.info(f"[App] Current working directory: {os.getcwd()}")
+logging.info(f"[App] RAW_DATA_PATH: {RAW_DATA_PATH} | exists: {RAW_DATA_PATH.exists()}")
+logging.info(f"[App] PROCESSED_DATA_PATH: {PROCESSED_DATA_PATH} | exists: {PROCESSED_DATA_PATH.exists()}")
+logging.info(f"[App] MODEL_PATH: {MODEL_PATH} | exists: {MODEL_PATH.exists()}")
+logging.info(f"[App] SCALER_PATH: {SCALER_PATH} | exists: {SCALER_PATH.exists()}")
 
 # Page Configuration
 st.set_page_config(
@@ -112,23 +110,83 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Helper function to load data
+
+# ──────────────────────────────────────────────────────────
+# Helper functions to load data (NO API calls)
+# ──────────────────────────────────────────────────────────
+
 @st.cache_data(ttl=3600)
 def load_raw_dataset():
+    """
+    Load the raw dataset from the local JSON file.
+    Does NOT call any API – the file must exist in the repository.
+    """
+    logging.info(f"[App] Loading raw dataset from {RAW_DATA_PATH}")
+
     if not RAW_DATA_PATH.exists():
-        fetch_raw_data()
-    with open(RAW_DATA_PATH, "r", encoding="utf-8") as f:
+        logging.error(f"[App] Raw data file NOT FOUND at {RAW_DATA_PATH}")
+        st.error(
+            f"❌ File dataset mentah tidak ditemukan di: `{RAW_DATA_PATH}`.\n\n"
+            f"Pastikan file `data/raw/raw_tourism_data.json` sudah di-commit "
+            f"ke repository dan tidak di-exclude oleh `.gitignore`."
+        )
+        return pd.DataFrame()
+
+    try:
         import json
-        data = json.load(f)
-    return pd.DataFrame(data["data"])
+        with open(RAW_DATA_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "data" not in data or not data["data"]:
+            st.error("❌ File JSON ditemukan tetapi key 'data' kosong atau tidak ada.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data["data"])
+        logging.info(f"[App] Raw dataset loaded: {len(df)} rows.")
+        return df
+
+    except Exception as e:
+        logging.error(f"[App] Failed to read raw data: {e}")
+        st.error(f"❌ Gagal membaca data lokal: {e}")
+        return pd.DataFrame()
+
 
 @st.cache_data(ttl=3600)
 def load_processed_dataset():
-    if not PROCESSED_DATA_PATH.exists():
-        build_features()
-    return pd.read_csv(PROCESSED_DATA_PATH)
+    """
+    Load the processed (feature-engineered) dataset from CSV.
+    Does NOT call build_features() or any API – the file must exist.
+    """
+    logging.info(f"[App] Loading processed dataset from {PROCESSED_DATA_PATH}")
 
+    if not PROCESSED_DATA_PATH.exists():
+        logging.error(f"[App] Processed data file NOT FOUND at {PROCESSED_DATA_PATH}")
+        st.error(
+            f"❌ File dataset hasil preprocessing tidak ditemukan di: `{PROCESSED_DATA_PATH}`.\n\n"
+            f"Pastikan file `data/processed/processed_tourism_data.csv` sudah di-commit "
+            f"ke repository dan tidak di-exclude oleh `.gitignore`."
+        )
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(PROCESSED_DATA_PATH)
+        logging.info(f"[App] Processed dataset loaded: {len(df)} rows.")
+
+        if df.empty:
+            st.warning("⚠️ File processed dataset ditemukan tetapi kosong (0 baris).")
+
+        return df
+
+    except Exception as e:
+        logging.error(f"[App] Failed to read processed data: {e}")
+        st.error(f"❌ Gagal membaca data hasil pemrosesan: {e}")
+        return pd.DataFrame()
+
+
+# ──────────────────────────────────────────────────────────
 # Sidebar setup
+# ──────────────────────────────────────────────────────────
+
 st.sidebar.markdown('<div class="sidebar-header">MENU NAVIGASI</div>', unsafe_allow_html=True)
 page = st.sidebar.radio(
     "Pilih Halaman:",
@@ -147,7 +205,9 @@ if page in ["🗺️ Hasil Cluster", "📊 Evaluasi & Perbandingan Model"]:
     st.sidebar.subheader("Informasi Klasterisasi")
     st.sidebar.info("""
     **Model**: K-Means
+    
     **Jumlah Cluster Optimal**: 3
+
     **Metode Penentuan**: Elbow Method + Silhouette Score
     """)
 
@@ -161,10 +221,19 @@ GROUP_MEMBERS = [
     {"nim": "20124074", "name": "MUHAMAD HASBI"},
 ]
 
+
+# ──────────────────────────────────────────────────────────
 # Page: DATASET
+# ──────────────────────────────────────────────────────────
+
 if page == "💾 Dataset":
     st.subheader("💾 Dataset Eksplorasi (Open Data Jabar)")
     raw_df = load_raw_dataset()
+
+    # Guard: stop if dataset is empty
+    if raw_df.empty:
+        st.warning("⚠️ Dataset kosong. Halaman ini tidak dapat menampilkan data.")
+        st.stop()
     
     # Pre-calculate metrics
     total_records = len(raw_df)
@@ -223,13 +292,22 @@ if page == "💾 Dataset":
         mime="text/csv"
     )
 
+
+# ──────────────────────────────────────────────────────────
 # Page: EDA
+# ──────────────────────────────────────────────────────────
+
 elif page == "📈 Exploratory Data Analysis (EDA)":
     st.subheader("📈 Exploratory Data Analysis (EDA)")
     st.write("Halaman ini menyajikan grafik interaktif untuk melihat distribusi dan tren wisatawan di Jawa Barat.")
     
     raw_df = load_raw_dataset()
     processed_df = load_processed_dataset()
+
+    # Guard: stop if either dataset is empty
+    if raw_df.empty or processed_df.empty:
+        st.warning("⚠️ Dataset kosong. Halaman EDA tidak dapat ditampilkan.")
+        st.stop()
     
     tab1, tab2, tab3 = st.tabs(["📊 Distribusi & Komposisi Wisatawan", "📈 Tren Kunjungan Tahunan", "🔍 Korelasi Fitur"])
     
@@ -297,11 +375,21 @@ elif page == "📈 Exploratory Data Analysis (EDA)":
         - Korelasi `total_mancanegara` dengan fitur lainnya bernilai positif sedang, mengindikasikan bahwa persebaran wisatawan mancanegara tidak selalu terdistribusi sama dengan wisatawan Nusantara (mancanegara cenderung hanya menumpuk di beberapa daerah tertentu).
         """)
 
+
+# ──────────────────────────────────────────────────────────
 # Page: EVALUASI & PERBANDINGAN MODEL
+# ──────────────────────────────────────────────────────────
+
 elif page == "📊 Evaluasi & Perbandingan Model":
 
     # Load data and normalise features
     processed_df = load_processed_dataset()
+
+    # Guard: stop if dataset is empty
+    if processed_df.empty:
+        st.error("❌ Dataset processed kosong. Tidak dapat melakukan evaluasi model.")
+        st.stop()
+
     cols = ["total_nusantara", "total_mancanegara", "total_pengunjung", "rata_rata_tahunan"]
     from tourism_clustering_jawabarat.features import normalize_features
     scaled_df, scaler_obj = normalize_features(processed_df, cols)
@@ -366,8 +454,6 @@ elif page == "📊 Evaluasi & Perbandingan Model":
         
     st.write("---")
     
-
-    
     # Section 6 - Visualisasi PCA 2 Dimensi
     st.write("### 🌌 Visualisasi PCA 2 Dimensi per Algoritma")
     tabs_list = st.tabs(["K-Means", "Agglomerative", "Birch", "GMM"])
@@ -388,15 +474,40 @@ elif page == "📊 Evaluasi & Perbandingan Model":
             
     st.write("---")
 
+
+# ──────────────────────────────────────────────────────────
 # Page: HASIL CLUSTER
+# ──────────────────────────────────────────────────────────
+
 elif page == "🗺️ Hasil Cluster":
     st.subheader("🗺️ Hasil Clustering K-Means")
     st.write("Halaman ini melatih model K-Means secara dinamis menggunakan parameter cluster pilihan Anda.")
-    
-    # Uses the global k_selected parameter defined in the sidebar
-    
-    # Train model dynamically
-    df_clustered, kmeans_model, scaler_model, label_map = train_and_save_kmeans(n_clusters=k_selected)
+
+    # Check that model files exist before proceeding
+    if not MODEL_PATH.exists() or not SCALER_PATH.exists():
+        st.error(
+            "❌ File model K-Means atau Scaler tidak ditemukan.\n\n"
+            f"- Model: `{MODEL_PATH}` → {'✅ Ada' if MODEL_PATH.exists() else '❌ Tidak ada'}\n"
+            f"- Scaler: `{SCALER_PATH}` → {'✅ Ada' if SCALER_PATH.exists() else '❌ Tidak ada'}\n\n"
+            "Pastikan file `models/kmeans_model.joblib` dan `models/scaler.joblib` "
+            "sudah di-commit ke repository."
+        )
+        st.stop()
+
+    # Check that processed dataset exists
+    if not PROCESSED_DATA_PATH.exists():
+        st.error(
+            f"❌ File dataset processed tidak ditemukan di: `{PROCESSED_DATA_PATH}`.\n\n"
+            f"Pastikan file `data/processed/processed_tourism_data.csv` sudah di-commit."
+        )
+        st.stop()
+
+    try:
+        # Load model and scaler offline
+        df_clustered, kmeans_model, scaler_model, label_map = load_and_apply_kmeans()
+    except Exception as e:
+        st.error(f"❌ Gagal menjalankan clustering: {e}")
+        st.stop()
     
     # Display Stats
     st.markdown("### 🏆 Profil Ringkasan Klaster")
@@ -455,5 +566,3 @@ elif page == "🗺️ Hasil Cluster":
         file_name=f"hasil_clustering_kmeans_k_{k_selected}.csv",
         mime="text/csv"
     )
-
-
